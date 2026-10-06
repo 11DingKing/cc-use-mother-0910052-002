@@ -14,13 +14,20 @@ from app.trading.base import (
     Position,
     Account,
 )
+from app.trading.ledger import (
+    FreezeLedger,
+    LedgerError,
+    REASON_CANCEL,
+    REASON_REJECT,
+    REASON_FILL,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class VnpyAdapter(TradingAdapter):
     """业务模块说明。"""
-    
+
     def __init__(self, config: Dict):
         super().__init__(config)
         self.gateway = config.get("gateway", "XTP")
@@ -28,6 +35,11 @@ class VnpyAdapter(TradingAdapter):
         self._orders: Dict[str, Order] = {}
         self._positions: Dict[str, Position] = {}
         self._account: Optional[Account] = None
+        # 无真实网关（本地回退）时，用冻结台账保证资金 / 持仓守恒
+        self.ledger: Optional[FreezeLedger] = None
+        self._commission_rate = Decimal(str(config.get("commission_rate", 0.0003)))
+        self._min_commission = Decimal(str(config.get("min_commission", 5)))
+        self._stamp_tax_rate = Decimal(str(config.get("stamp_tax_rate", 0.001)))
     
     def connect(self) -> bool:
         """业务模块说明。"""
@@ -101,6 +113,7 @@ class VnpyAdapter(TradingAdapter):
             profit_loss=Decimal("0"),
             profit_loss_ratio=0.0,
         )
+        self.ledger = FreezeLedger(self._account, self._positions)
         logger.info("Connected in simulation mode")
         return True
     
@@ -212,17 +225,49 @@ class VnpyAdapter(TradingAdapter):
                     order.status = OrderStatus.REJECTED
                     order.error_message = "下单被拒绝"
             else:
-                # 模拟模式
-                order.status = OrderStatus.FILLED
-                order.filled_quantity = order.quantity
-                order.filled_price = order.price
-                order.updated_at = datetime.now()
-                self._orders[order.order_id] = order
-                
-                # 更新持仓
-                self._update_simulation_position(order)
-                self._emit("on_order", order)
-                self._emit("on_trade", order)
+                # 模拟回退模式：冻结 -> 结算，全部经台账以保持守恒
+                with self.ledger.lock:
+                    reference = order.price or Decimal("10")
+                    try:
+                        entry = self.ledger.freeze(
+                            order,
+                            reference_price=reference,
+                            commission_rate=self._commission_rate,
+                            min_commission=self._min_commission,
+                        )
+                    except LedgerError as e:
+                        order.status = OrderStatus.REJECTED
+                        order.error_message = str(e)
+                        return order
+
+                    order.freeze_rule = entry.rule
+                    order.frozen_amount = entry.frozen_cash
+                    order.frozen_quantity = entry.frozen_qty
+                    order.status = OrderStatus.SUBMITTED
+                    order.updated_at = datetime.now()
+                    self._orders[order.order_id] = order
+
+                    fill_price = order.price or reference
+                    gross = fill_price * order.quantity
+                    commission = max(gross * self._commission_rate, self._min_commission)
+                    if order.side == OrderSide.SELL:
+                        commission += gross * self._stamp_tax_rate
+                    self.ledger.settle_fill(
+                        order,
+                        fill_quantity=order.quantity,
+                        fill_price=fill_price,
+                        commission=commission,
+                    )
+                    order.status = OrderStatus.FILLED
+                    order.filled_quantity = order.quantity
+                    order.filled_price = fill_price
+                    order.commission = commission
+                    # 全额成交后释放买入预留的费用差额
+                    self.ledger.release(order, reason=REASON_FILL,
+                                        note="remainder after full fill")
+                    self._refresh_simulation_account()
+                    self._emit("on_order", order)
+                    self._emit("on_trade", order)
             
         except Exception as e:
             logger.error(f"Place order error: {e}")
@@ -242,52 +287,52 @@ class VnpyAdapter(TradingAdapter):
         else:
             return Exchange.SSE
     
-    def _update_simulation_position(self, order: Order) -> None:
-        """业务模块说明。"""
-        if order.stock_code not in self._positions:
-            if order.side == OrderSide.BUY:
-                self._positions[order.stock_code] = Position(
-                    stock_code=order.stock_code,
-                    stock_name=order.stock_code,
-                    quantity=order.filled_quantity,
-                    available_quantity=order.filled_quantity,
-                    avg_cost=order.filled_price,
-                    current_price=order.filled_price,
-                    market_value=order.filled_price * order.filled_quantity,
-                    profit_loss=Decimal("0"),
-                    profit_loss_ratio=0.0,
-                )
-        else:
-            pos = self._positions[order.stock_code]
-            if order.side == OrderSide.BUY:
-                total_cost = pos.avg_cost * pos.quantity + order.filled_price * order.filled_quantity
-                new_qty = pos.quantity + order.filled_quantity
-                pos.quantity = new_qty
-                pos.available_quantity = new_qty
-                pos.avg_cost = total_cost / new_qty if new_qty > 0 else Decimal("0")
-            else:
-                pos.quantity -= order.filled_quantity
-                pos.available_quantity = pos.quantity
-            
+    def _refresh_simulation_account(self) -> None:
+        """台账变动后重算市值与总资产（可用/冻结由台账维护）。"""
+        if not self._account:
+            return
+        empty = [c for c, p in self._positions.items() if p.quantity <= 0]
+        for code in empty:
+            del self._positions[code]
+        for pos in self._positions.values():
             pos.market_value = pos.current_price * pos.quantity
-            pos.updated_at = datetime.now()
-            
-            if pos.quantity <= 0:
-                del self._positions[order.stock_code]
-        
-        # 更新账户
-        if self._account:
-            if order.side == OrderSide.BUY:
-                self._account.available_cash -= order.filled_price * order.filled_quantity
-            else:
-                self._account.available_cash += order.filled_price * order.filled_quantity
-            
-            self._account.market_value = sum(
-                p.market_value for p in self._positions.values()
-            )
-            self._account.total_assets = self._account.available_cash + self._account.market_value
-            self._account.updated_at = datetime.now()
-    
+        self._account.market_value = sum(
+            p.market_value for p in self._positions.values()
+        )
+        self._account.total_assets = (
+            self._account.available_cash
+            + self._account.frozen_cash
+            + self._account.market_value
+        )
+        self._account.updated_at = datetime.now()
+
+    def freeze_report(self) -> Dict:
+        """回退模式下的现金/持仓差异解释与守恒校验；实盘网关由券商冻结。"""
+        if self.ledger is None:
+            return {
+                "cash": {"note": "真实网关模式，冻结以券商账户为准"},
+                "positions": [],
+                "conservation": {"cash_conservation_ok": True},
+            }
+        with self.ledger.lock:
+            return {
+                "cash": self.ledger.account_breakdown(),
+                "positions": self.ledger.position_breakdown(),
+                "conservation": self.ledger.conservation_report(),
+            }
+
+    def freeze_entries(self, active_only: bool = True) -> List[Dict]:
+        """逐笔冻结记录。"""
+        if self.ledger is None:
+            return []
+        return [e.to_dict() for e in self.ledger.list_entries(active_only)]
+
+    def freeze_moves(self, order_id: Optional[str] = None) -> List[Dict]:
+        """审计流水。"""
+        if self.ledger is None:
+            return []
+        return [m.to_dict() for m in self.ledger.moves(order_id)]
+
     def cancel_order(self, order_id: str) -> bool:
         """业务模块说明。"""
         if not self._connected:
@@ -313,11 +358,18 @@ class VnpyAdapter(TradingAdapter):
                 self._emit("on_order", order)
                 return True
             else:
-                # 模拟模式
+                # 模拟模式：台账幂等释放剩余冻结
                 order = self._orders.get(order_id)
-                if order and order.status == OrderStatus.SUBMITTED:
+                if order and order.status in (
+                    OrderStatus.SUBMITTED,
+                    OrderStatus.PENDING,
+                    OrderStatus.PARTIAL_FILLED,
+                ):
+                    if self.ledger is not None:
+                        self.ledger.release(order, reason=REASON_CANCEL)
                     order.status = OrderStatus.CANCELLED
                     order.updated_at = datetime.now()
+                    self._refresh_simulation_account()
                     self._emit("on_order", order)
                     return True
                 return False

@@ -53,15 +53,23 @@ class Order:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     error_message: Optional[str] = None
-    
+
     # 策略相关
     strategy_name: Optional[str] = None
     signal_type: Optional[str] = None     # 买卖点类型，如 BUY_1, SELL_2
     signal_strength: float = 0.0
-    
+
+    # 客户端幂等单号：并发重试同号请求只产生一笔委托，杜绝重复承诺
+    client_order_id: Optional[str] = None
+    # 冻结快照（订单确认时由冻结台账回填，规则确认后不可变）
+    freeze_rule: Optional[str] = None
+    frozen_amount: Decimal = Decimal("0")     # 确认时冻结的现金（买）
+    frozen_quantity: int = 0                  # 确认时冻结的持仓数量（卖）
+
     def to_dict(self) -> Dict:
         return {
             "order_id": self.order_id,
+            "client_order_id": self.client_order_id,
             "stock_code": self.stock_code,
             "side": self.side.value,
             "order_type": self.order_type.value,
@@ -78,6 +86,9 @@ class Order:
             "strategy_name": self.strategy_name,
             "signal_type": self.signal_type,
             "signal_strength": self.signal_strength,
+            "freeze_rule": self.freeze_rule,
+            "frozen_amount": float(self.frozen_amount),
+            "frozen_quantity": self.frozen_quantity,
         }
 
 
@@ -87,20 +98,22 @@ class Position:
     stock_code: str
     stock_name: str
     quantity: int                         # 持仓数量
-    available_quantity: int               # 可用数量
+    available_quantity: int               # 可用数量（未被卖出委托冻结）
     avg_cost: Decimal                     # 持仓成本
     current_price: Decimal                # 当前价格
     market_value: Decimal                 # 市值
     profit_loss: Decimal                  # 盈亏金额
     profit_loss_ratio: float              # 盈亏比例
+    frozen_quantity: int = 0              # 卖出委托冻结数量（由台账回填）
     updated_at: datetime = field(default_factory=datetime.now)
-    
+
     def to_dict(self) -> Dict:
         return {
             "stock_code": self.stock_code,
             "stock_name": self.stock_name,
             "quantity": self.quantity,
             "available_quantity": self.available_quantity,
+            "frozen_quantity": self.frozen_quantity,
             "avg_cost": float(self.avg_cost),
             "current_price": float(self.current_price),
             "market_value": float(self.market_value),

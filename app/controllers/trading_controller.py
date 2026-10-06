@@ -24,6 +24,7 @@ class BuyRequest(BaseModel):
     order_type: str = "limit"  # limit, market
     signal_type: Optional[str] = None
     signal_strength: float = 0.0
+    client_order_id: Optional[str] = None  # 客户端幂等单号
 
 
 class SellRequest(BaseModel):
@@ -34,6 +35,12 @@ class SellRequest(BaseModel):
     order_type: str = "limit"
     signal_type: Optional[str] = None
     signal_strength: float = 0.0
+    client_order_id: Optional[str] = None  # 客户端幂等单号
+
+
+class RetryRequest(BaseModel):
+    """业务模块说明。"""
+    price: Optional[float] = None
 
 
 class SignalTradeRequest(BaseModel):
@@ -94,6 +101,7 @@ async def buy(request: BuyRequest):
         order_type=request.order_type,
         signal_type=request.signal_type,
         signal_strength=request.signal_strength,
+        client_order_id=request.client_order_id,
     )
 
 
@@ -107,6 +115,7 @@ async def sell(request: SellRequest):
         order_type=request.order_type,
         signal_type=request.signal_type,
         signal_strength=request.signal_strength,
+        client_order_id=request.client_order_id,
     )
 
 
@@ -114,6 +123,24 @@ async def sell(request: SellRequest):
 async def cancel_order(order_id: str):
     """业务模块说明。"""
     return trading_service.cancel_order(order_id)
+
+
+@router.post("/orders/{order_id}/retry")
+async def retry_order(order_id: str, request: RetryRequest):
+    """释放旧冻结后按新价格重试委托。"""
+    return trading_service.retry_order(order_id, request.price)
+
+
+@router.get("/freeze/report")
+async def freeze_report(order_id: Optional[str] = Query(default=None, description="只看该订单的变动流水")):
+    """可用 / 冻结 / 已结算的差异解释与守恒校验。"""
+    return trading_service.get_freeze_report(order_id)
+
+
+@router.get("/freeze/moves")
+async def freeze_moves(order_id: Optional[str] = Query(default=None, description="按订单过滤流水")):
+    """冻结 / 部分成交结算 / 释放的审计流水。"""
+    return {"moves": trading_service.get_freeze_moves(order_id)}
 
 
 @router.get("/orders/{order_id}")

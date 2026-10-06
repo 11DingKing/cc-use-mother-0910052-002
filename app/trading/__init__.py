@@ -11,6 +11,7 @@ from app.trading.base import (
 )
 from app.trading.vnpy_adapter import VnpyAdapter
 from app.trading.simulation_adapter import SimulationAdapter
+from app.trading.ledger import FreezeLedger, LedgerError
 
 __all__ = [
     "TradingAdapter",
@@ -22,4 +23,6 @@ __all__ = [
     "Account",
     "VnpyAdapter",
     "SimulationAdapter",
+    "FreezeLedger",
+    "LedgerError",
 ]
