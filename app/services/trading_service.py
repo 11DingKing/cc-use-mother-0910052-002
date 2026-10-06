@@ -93,6 +93,7 @@ class TradingService:
         order_type: str = "limit",
         signal_type: Optional[str] = None,
         signal_strength: float = 0.0,
+        client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """业务模块说明。"""
         # 数量校验
@@ -101,13 +102,13 @@ class TradingService:
                 "买入数量必须是100的整数倍",
                 stock_code=stock_code,
             )
-        
+
         # 构建订单
         ot = OrderType.LIMIT if order_type == "limit" else OrderType.MARKET
-        
+
         if ot == OrderType.LIMIT and price is None:
             raise TradingException("限价单必须指定价格", stock_code=stock_code)
-        
+
         order = Order(
             order_id=self.adapter._generate_order_id(),
             stock_code=stock_code,
@@ -117,33 +118,35 @@ class TradingService:
             price=Decimal(str(price)) if price else None,
             signal_type=signal_type,
             signal_strength=signal_strength,
+            client_order_id=client_order_id,
         )
-        
-        # 风控检查
+
+        # 风控预检（advisory）；真正的额度承诺由适配器在锁内原子冻结，
+        # 因此并发下即使预检与下单之间有竞争，也不会超额冻结
         account = self.adapter.get_account()
         positions = self.adapter.get_positions()
-        
+
         passed, reason = self.risk_manager.check_order(order, account, positions)
         if not passed:
             raise TradingException(
                 f"风控检查未通过: {reason}",
                 stock_code=stock_code,
             )
-        
-        # 执行下单
+
+        # 执行下单（确认即冻结；冻结失败会以 REJECTED 返回，账户零变动）
         result = self.adapter.place_order(order)
-        
+
         if result.status in (OrderStatus.REJECTED, OrderStatus.FAILED):
             raise TradingException(
                 f"下单失败: {result.error_message}",
                 order_id=result.order_id,
                 stock_code=stock_code,
             )
-        
+
         # 记录交易金额
         if result.status == OrderStatus.FILLED:
             self.risk_manager.record_trade(result.filled_price * result.filled_quantity)
-        
+
         return result.to_dict()
     
     def sell(
@@ -154,23 +157,22 @@ class TradingService:
         order_type: str = "limit",
         signal_type: Optional[str] = None,
         signal_strength: float = 0.0,
+        client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """业务模块说明。"""
-        # 持仓检查
-        position = self.adapter.get_position(stock_code)
-        if not position or position.available_quantity < quantity:
-            available = position.available_quantity if position else 0
+        # 数量校验（卖出允许零股，不强制 100 整数倍）
+        if quantity <= 0:
             raise TradingException(
-                f"可用持仓不足，需要 {quantity}，可用 {available}",
+                "卖出数量必须为正",
                 stock_code=stock_code,
             )
-        
+
         # 构建订单
         ot = OrderType.LIMIT if order_type == "limit" else OrderType.MARKET
-        
+
         if ot == OrderType.LIMIT and price is None:
             raise TradingException("限价单必须指定价格", stock_code=stock_code)
-        
+
         order = Order(
             order_id=self.adapter._generate_order_id(),
             stock_code=stock_code,
@@ -180,38 +182,88 @@ class TradingService:
             price=Decimal(str(price)) if price else None,
             signal_type=signal_type,
             signal_strength=signal_strength,
+            client_order_id=client_order_id,
         )
-        
-        # 执行下单
+
+        # 可用持仓的预检仅用于友好报错；真正的占用由适配器在锁内原子
+        # 预留，两个并发卖单不会承诺同一批持仓
+        position = self.adapter.get_position(stock_code)
+        if not position or position.available_quantity < quantity:
+            available = position.available_quantity if position else 0
+            raise TradingException(
+                f"可用持仓不足，需要 {quantity}，可用 {available}",
+                stock_code=stock_code,
+            )
+
+        # 执行下单（确认即冻结持仓；冻结失败以 REJECTED 返回，零变动）
         result = self.adapter.place_order(order)
-        
+
         if result.status in (OrderStatus.REJECTED, OrderStatus.FAILED):
             raise TradingException(
                 f"下单失败: {result.error_message}",
                 order_id=result.order_id,
                 stock_code=stock_code,
             )
-        
+
         return result.to_dict()
-    
+
     def cancel_order(self, order_id: str) -> Dict[str, Any]:
         """业务模块说明。"""
         order = self.adapter.get_order(order_id)
         if not order:
             raise TradingException("订单不存在", order_id=order_id)
-        
-        if order.status not in (OrderStatus.PENDING, OrderStatus.SUBMITTED):
+
+        if order.status not in (
+            OrderStatus.PENDING,
+            OrderStatus.SUBMITTED,
+            OrderStatus.PARTIAL_FILLED,
+        ):
             raise TradingException(
                 f"订单状态为 {order.status.value}，无法撤销",
                 order_id=order_id,
             )
-        
+
         success = self.adapter.cancel_order(order_id)
         if not success:
             raise TradingException("撤单失败", order_id=order_id)
-        
+
         order = self.adapter.get_order(order_id)
         return order.to_dict()
+
+    def apply_fill(
+        self,
+        order_id: str,
+        fill_quantity: Optional[int] = None,
+        fill_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """驱动挂起限价单产生（部分）成交，主要用于模拟成交回报 / 测试。"""
+        try:
+            order = self.adapter.apply_fill(order_id, fill_quantity, fill_price)
+        except AttributeError:
+            raise TradingException("当前交易适配器不支持手工成交回报", order_id=order_id)
+        except Exception as exc:
+            raise TradingException(f"成交回报失败: {exc}", order_id=order_id)
+        return order.to_dict()
+
+    def recover(self) -> Dict[str, Any]:
+        """重连 / 故障恢复后对冻结台账做对账，修平漂移、回收孤儿冻结。"""
+        if not hasattr(self.adapter, "recover"):
+            return {"supported": False, "repaired": [], "orphans": []}
+        report = self.adapter.recover()
+        report["supported"] = True
+        return report
+
+    def get_freeze_events(self, order_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """查询冻结流水：每笔现金 / 持仓的预留、结算、释放都可追溯。"""
+        if not hasattr(self.adapter, "get_freeze_events"):
+            return []
+        return self.adapter.get_freeze_events(order_id)
+
+    def get_reservations(self) -> List[Dict[str, Any]]:
+        """查询当前在途占用（未成交完的买单现金 / 卖单持仓）。"""
+        if not hasattr(self.adapter, "get_reservations"):
+            return []
+        return self.adapter.get_reservations()
     
     def get_order(self, order_id: str) -> Dict[str, Any]:
         """业务模块说明。"""

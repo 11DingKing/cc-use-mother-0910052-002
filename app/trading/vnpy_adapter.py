@@ -1,6 +1,14 @@
-"""业务模块说明。"""
+"""业务模块说明。
+
+真实网关下，资金 / 持仓的冻结权威在券商：``available = balance - frozen``、
+``available_volume = volume - frozen`` 直接来自账户与持仓回报，本适配器不
+另立本地台账（避免与券商冻结双重记账）。并发提交由网关保证，这里用一把锁
+保护本地订单 / 持仓字典；未安装 vnpy 时的内置模拟路径订单即时成交，不产生
+在途冻结。需要完整本地冻结 / 部分成交 / 恢复语义时使用 ``SimulationAdapter``。
+"""
 
 import logging
+import threading
 from datetime import datetime
 from decimal import Decimal
 from typing import Dict, List, Optional
@@ -28,6 +36,7 @@ class VnpyAdapter(TradingAdapter):
         self._orders: Dict[str, Order] = {}
         self._positions: Dict[str, Position] = {}
         self._account: Optional[Account] = None
+        self._lock = threading.RLock()
     
     def connect(self) -> bool:
         """业务模块说明。"""
@@ -173,6 +182,10 @@ class VnpyAdapter(TradingAdapter):
     
     def place_order(self, order: Order) -> Order:
         """业务模块说明。"""
+        with self._lock:
+            return self._place_order_locked(order)
+
+    def _place_order_locked(self, order: Order) -> Order:
         if not self._connected:
             order.status = OrderStatus.FAILED
             order.error_message = "交易连接已断开"
@@ -290,6 +303,10 @@ class VnpyAdapter(TradingAdapter):
     
     def cancel_order(self, order_id: str) -> bool:
         """业务模块说明。"""
+        with self._lock:
+            return self._cancel_order_locked(order_id)
+
+    def _cancel_order_locked(self, order_id: str) -> bool:
         if not self._connected:
             return False
         

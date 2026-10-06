@@ -24,6 +24,7 @@ class BuyRequest(BaseModel):
     order_type: str = "limit"  # limit, market
     signal_type: Optional[str] = None
     signal_strength: float = 0.0
+    client_order_id: Optional[str] = None  # 客户端幂等键，超时重试不重复冻结
 
 
 class SellRequest(BaseModel):
@@ -34,6 +35,13 @@ class SellRequest(BaseModel):
     order_type: str = "limit"
     signal_type: Optional[str] = None
     signal_strength: float = 0.0
+    client_order_id: Optional[str] = None
+
+
+class FillRequest(BaseModel):
+    """挂起订单的（部分）成交回报，用于模拟成交驱动。"""
+    fill_quantity: Optional[int] = None
+    fill_price: Optional[float] = None
 
 
 class SignalTradeRequest(BaseModel):
@@ -94,6 +102,7 @@ async def buy(request: BuyRequest):
         order_type=request.order_type,
         signal_type=request.signal_type,
         signal_strength=request.signal_strength,
+        client_order_id=request.client_order_id,
     )
 
 
@@ -107,6 +116,7 @@ async def sell(request: SellRequest):
         order_type=request.order_type,
         signal_type=request.signal_type,
         signal_strength=request.signal_strength,
+        client_order_id=request.client_order_id,
     )
 
 
@@ -114,6 +124,40 @@ async def sell(request: SellRequest):
 async def cancel_order(order_id: str):
     """业务模块说明。"""
     return trading_service.cancel_order(order_id)
+
+
+@router.post("/orders/{order_id}/fills")
+async def apply_fill(order_id: str, request: FillRequest):
+    """对挂起/部分成交的订单录入一笔（部分）成交。"""
+    return trading_service.apply_fill(
+        order_id,
+        fill_quantity=request.fill_quantity,
+        fill_price=request.fill_price,
+    )
+
+
+@router.get("/orders/{order_id}/freeze-events")
+async def get_order_freeze_events(order_id: str):
+    """单笔订单的冻结/结算/释放流水，解释额度去向。"""
+    return {"order_id": order_id, "events": trading_service.get_freeze_events(order_id)}
+
+
+@router.get("/freeze-events")
+async def get_freeze_events():
+    """全部冻结流水（只追加），用于审计与差异解释。"""
+    return {"events": trading_service.get_freeze_events()}
+
+
+@router.get("/reservations")
+async def get_reservations():
+    """当前仍在途的占用：买单冻结现金、卖单冻结持仓。"""
+    return {"reservations": trading_service.get_reservations()}
+
+
+@router.post("/recover")
+async def recover():
+    """重连/故障恢复后对账：按订单确认快照重建占用、回收孤儿冻结。"""
+    return trading_service.recover()
 
 
 @router.get("/orders/{order_id}")

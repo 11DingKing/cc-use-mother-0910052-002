@@ -53,13 +53,25 @@ class Order:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     error_message: Optional[str] = None
-    
+
     # 策略相关
     strategy_name: Optional[str] = None
     signal_type: Optional[str] = None     # 买卖点类型，如 BUY_1, SELL_2
     signal_strength: float = 0.0
+
+    # 冻结规则在订单确认时固定，后续成交/撤单/恢复均以此快照为准
+    client_order_id: Optional[str] = None       # 客户端幂等键，防重放重复冻结
+    frozen_price: Optional[Decimal] = None      # 冻结时采用的单价（买入）
+    frozen_cash: Decimal = Decimal("0")         # 该订单当前仍占用的现金
+    frozen_quantity: int = 0                    # 该订单当前仍占用的持仓股数（卖出）
+    estimated_commission: Decimal = Decimal("0")  # 确认时预估的费用
+    settled_quantity: int = 0                   # 已成交结算的数量
+    released_cash: Decimal = Decimal("0")       # 累计释放回可用的现金
+    released_quantity: int = 0                  # 累计释放回可用的持仓
+    freeze_state: str = "none"                  # none/active/partial/settled/released
     
     def to_dict(self) -> Dict:
+        remaining_qty = self.quantity - self.filled_quantity
         return {
             "order_id": self.order_id,
             "stock_code": self.stock_code,
@@ -70,6 +82,7 @@ class Order:
             "stop_price": float(self.stop_price) if self.stop_price else None,
             "status": self.status.value,
             "filled_quantity": self.filled_quantity,
+            "remaining_quantity": remaining_qty,
             "filled_price": float(self.filled_price) if self.filled_price else None,
             "commission": float(self.commission),
             "created_at": self.created_at.isoformat(),
@@ -78,6 +91,16 @@ class Order:
             "strategy_name": self.strategy_name,
             "signal_type": self.signal_type,
             "signal_strength": self.signal_strength,
+            # 冻结/结算可追踪字段：解释这笔订单占用与释放了什么
+            "client_order_id": self.client_order_id,
+            "freeze_state": self.freeze_state,
+            "frozen_price": float(self.frozen_price) if self.frozen_price else None,
+            "frozen_cash": float(self.frozen_cash),
+            "frozen_quantity": self.frozen_quantity,
+            "estimated_commission": float(self.estimated_commission),
+            "settled_quantity": self.settled_quantity,
+            "released_cash": float(self.released_cash),
+            "released_quantity": self.released_quantity,
         }
 
 
@@ -86,27 +109,36 @@ class Position:
     """业务模块说明。"""
     stock_code: str
     stock_name: str
-    quantity: int                         # 持仓数量
-    available_quantity: int               # 可用数量
+    quantity: int                         # 持仓数量（已结算）
+    available_quantity: int               # 可用数量 = quantity - frozen_quantity
     avg_cost: Decimal                     # 持仓成本
     current_price: Decimal                # 当前价格
     market_value: Decimal                 # 市值
     profit_loss: Decimal                  # 盈亏金额
     profit_loss_ratio: float              # 盈亏比例
+    frozen_quantity: int = 0              # 在途卖单冻结的股数
     updated_at: datetime = field(default_factory=datetime.now)
-    
+
     def to_dict(self) -> Dict:
         return {
             "stock_code": self.stock_code,
             "stock_name": self.stock_name,
             "quantity": self.quantity,
             "available_quantity": self.available_quantity,
+            "frozen_quantity": self.frozen_quantity,
             "avg_cost": float(self.avg_cost),
             "current_price": float(self.current_price),
             "market_value": float(self.market_value),
             "profit_loss": float(self.profit_loss),
             "profit_loss_ratio": self.profit_loss_ratio,
             "updated_at": self.updated_at.isoformat(),
+            # 差异解释：持仓 = 可用 + 冻结
+            "breakdown": {
+                "settled": self.quantity,
+                "available": self.available_quantity,
+                "reserved": self.frozen_quantity,
+                "formula": "quantity(已结算持仓) = available(可用) + frozen(卖单占用)",
+            },
         }
 
 
@@ -117,12 +149,14 @@ class Account:
     broker: str                           # 券商/平台名称
     total_assets: Decimal                 # 总资产
     available_cash: Decimal               # 可用资金
-    frozen_cash: Decimal                  # 冻结资金
+    frozen_cash: Decimal                  # 冻结资金（在途买单占用）
     market_value: Decimal                 # 持仓市值
     profit_loss: Decimal                  # 当日盈亏
     profit_loss_ratio: float              # 当日盈亏比例
+    capital_cash: Decimal = Decimal("0")  # 初始/入金现金基数，用于守恒校验
+    settled_cash: Decimal = Decimal("0")  # 已结算净现金占用（买支出-卖收入-费用）
     updated_at: datetime = field(default_factory=datetime.now)
-    
+
     def to_dict(self) -> Dict:
         return {
             "account_id": self.account_id,
@@ -130,10 +164,23 @@ class Account:
             "total_assets": float(self.total_assets),
             "available_cash": float(self.available_cash),
             "frozen_cash": float(self.frozen_cash),
+            "settled_cash": float(self.settled_cash),
+            "capital_cash": float(self.capital_cash),
             "market_value": float(self.market_value),
             "profit_loss": float(self.profit_loss),
             "profit_loss_ratio": self.profit_loss_ratio,
             "updated_at": self.updated_at.isoformat(),
+            # 差异解释：初始资金 = 可用 + 占用 + 已结算净流出；
+            # 总资产 = 现金钱包(可用+占用) + 持仓市值
+            "breakdown": {
+                "capital": float(self.capital_cash),
+                "available": float(self.available_cash),
+                "reserved": float(self.frozen_cash),
+                "settled": float(self.settled_cash),
+                "cash_wallet": float(self.available_cash + self.frozen_cash),
+                "cash_formula": "capital_cash(入金) = available(可用) + frozen(买单占用) + settled(已结算净流出)",
+                "asset_formula": "total_assets(总资产) = available + frozen + market_value(持仓市值)",
+            },
         }
 
 
